@@ -1,5 +1,6 @@
 import os
 import re
+import uuid
 import sqlite3
 import hashlib
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Optional, Tuple, List
 import pandas as pd
 import requests
 import streamlit as st
+import extra_streamlit_components as stx
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -22,7 +24,7 @@ st.set_page_config(page_title="个人交易中心", page_icon="📈", layout="wi
 st.markdown(
     """
     <style>
-    .block-container {padding-top: 1.0rem; padding-bottom: 2rem; max-width: 1500px;}
+    .block-container {padding-top: 1rem; padding-bottom: 2rem; max-width: 1500px;}
     .big-title {font-size: 2.3rem; font-weight: 800; margin-bottom: 0.2rem;}
     .subtle {color: #6b7280; font-size: 1rem; margin-bottom: 1rem;}
     .card {
@@ -43,7 +45,7 @@ st.markdown(
     }
     .kpi-label {font-size: 0.95rem; color: #6b7280; margin-bottom: 6px;}
     .kpi-value {font-size: 2rem; font-weight: 800; line-height: 1.15;}
-    .kpi-small {font-size: 1.25rem; font-weight: 700; line-height: 1.2;}
+    .kpi-small {font-size: 1.18rem; font-weight: 700; line-height: 1.25;}
     .profit { color: #16a34a; }
     .loss { color: #dc2626; }
     .neutral { color: #111827; }
@@ -71,11 +73,8 @@ st.markdown(
 DATA_DIR = Path(os.getenv("DATA_DIR", str(Path.home())))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "stock_margin_tracker.db"
+AUTH_COOKIE_NAME = "ytc_auth_token"
 
-
-# -------------------------
-# 固定初始化账户
-# -------------------------
 DEFAULT_USERS = [
     {"login_name": "admin", "display_name": "管理员", "password": "060913yu", "role": "admin", "mode": "admin"},
     {"login_name": "俞", "display_name": "俞", "password": "060913", "role": "user", "mode": "margin"},
@@ -117,9 +116,6 @@ class PositionMetrics:
     net_profit_after_fee_pct_cost: float
 
 
-# -------------------------
-# 通用函数
-# -------------------------
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
@@ -157,6 +153,14 @@ def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def mode_label(mode: str) -> str:
+    if mode == "margin":
+        return "融资模式"
+    if mode == "normal":
+        return "普通模式"
+    return "管理员"
+
+
 def pnl_class(v: float) -> str:
     if v > 0:
         return "profit"
@@ -173,17 +177,45 @@ def pnl_badge(v: float) -> str:
     return '<span class="pill-gray">持平</span>'
 
 
-def mode_label(mode: str) -> str:
-    if mode == "margin":
-        return "融资模式"
-    if mode == "normal":
-        return "普通模式"
-    return "管理员"
+def render_big_card(label: str, value: str, class_name: str = "neutral", badge: Optional[str] = None):
+    badge_html = f'<div style="margin-top:8px">{badge}</div>' if badge else ""
+    st.markdown(
+        f'''
+        <div class="card">
+            <div class="kpi-label">{label}</div>
+            <div class="kpi-value {class_name}">{value}</div>
+            {badge_html}
+        </div>
+        ''',
+        unsafe_allow_html=True,
+    )
 
 
-# -------------------------
-# 数据库
-# -------------------------
+def render_small_card(label: str, value: str, class_name: str = "neutral"):
+    st.markdown(
+        f'''
+        <div class="card">
+            <div class="kpi-label">{label}</div>
+            <div class="kpi-small {class_name}">{value}</div>
+        </div>
+        ''',
+        unsafe_allow_html=True,
+    )
+
+
+def render_login_hero():
+    st.markdown(
+        '''
+        <div class="hero">
+            <div class="big-title">📈 个人交易中心</div>
+            <div class="subtle">支持多账户登录、普通账户、融资账户、管理员后台、多账户总览和实时股票行情。</div>
+            <div style="margin-top:8px;"><span class="pill-blue">普通模式</span> <span class="pill-red">融资模式</span> <span class="pill-gray">管理员后台</span></div>
+        </div>
+        ''',
+        unsafe_allow_html=True,
+    )
+
+
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -265,9 +297,23 @@ def init_db() -> None:
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            session_token TEXT UNIQUE NOT NULL,
+            expires_at TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+
     conn.commit()
 
-    # 初始化默认用户
     for u in DEFAULT_USERS:
         cur.execute("SELECT id FROM users WHERE login_name = ?", (u["login_name"],))
         row = cur.fetchone()
@@ -287,6 +333,7 @@ def init_db() -> None:
                     now_str(),
                 ),
             )
+
     conn.commit()
     conn.close()
 
@@ -325,6 +372,7 @@ def create_user(login_name: str, display_name: str, password: str, role: str, mo
         return False, "用户名和密码不能为空。"
     if get_user_by_login(login_name.strip()):
         return False, "该用户名已存在。"
+
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -353,7 +401,10 @@ def update_user_password(login_name: str, new_password: str, actor: str) -> Tupl
         return False, "新密码不能为空。"
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("UPDATE users SET password_hash = ?, updated_at = ? WHERE login_name = ?", (hash_password(new_password.strip()), now_str(), login_name))
+    cur.execute(
+        "UPDATE users SET password_hash = ?, updated_at = ? WHERE login_name = ?",
+        (hash_password(new_password.strip()), now_str(), login_name),
+    )
     conn.commit()
     changed = cur.rowcount
     conn.close()
@@ -424,7 +475,21 @@ def save_normal_position(user_id: int, stock_code: str, stock_name: str, buy_pri
     log_action(actor, "新增普通持仓", str(user_id), f"{stock_code} / {shares}股")
 
 
-def save_margin_position(user_id: int, stock_code: str, stock_name: str, buy_price: float, shares: int, buy_time: str, total_cost: float, financed_principal: float, leverage: float, fee_daily_rate_pct: float, held_days: float, note: str, actor: str) -> None:
+def save_margin_position(
+    user_id: int,
+    stock_code: str,
+    stock_name: str,
+    buy_price: float,
+    shares: int,
+    buy_time: str,
+    total_cost: float,
+    financed_principal: float,
+    leverage: float,
+    fee_daily_rate_pct: float,
+    held_days: float,
+    note: str,
+    actor: str,
+) -> None:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -432,11 +497,107 @@ def save_margin_position(user_id: int, stock_code: str, stock_name: str, buy_pri
         INSERT INTO margin_positions (user_id, stock_code, stock_name, buy_price, shares, buy_time, total_cost, financed_principal, leverage, fee_daily_rate_pct, held_days, note, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (user_id, normalize_code(stock_code), stock_name, buy_price, shares, buy_time, total_cost, financed_principal, leverage, fee_daily_rate_pct, held_days, note, now_str(), now_str()),
+        (
+            user_id,
+            normalize_code(stock_code),
+            stock_name,
+            buy_price,
+            shares,
+            buy_time,
+            total_cost,
+            financed_principal,
+            leverage,
+            fee_daily_rate_pct,
+            held_days,
+            note,
+            now_str(),
+            now_str(),
+        ),
     )
     conn.commit()
     conn.close()
     log_action(actor, "新增融资持仓", str(user_id), f"{stock_code} / {shares}股")
+
+
+def update_normal_position(
+    position_id: int,
+    stock_code: str,
+    stock_name: str,
+    buy_price: float,
+    shares: int,
+    buy_time: str,
+    total_cost: float,
+    note: str,
+    actor: str,
+) -> None:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE normal_positions
+        SET stock_code = ?, stock_name = ?, buy_price = ?, shares = ?, buy_time = ?, total_cost = ?, note = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            normalize_code(stock_code),
+            stock_name,
+            buy_price,
+            shares,
+            buy_time,
+            total_cost,
+            note,
+            now_str(),
+            position_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    log_action(actor, "修改普通持仓", str(position_id), f"{stock_code} / {shares}股")
+
+
+def update_margin_position(
+    position_id: int,
+    stock_code: str,
+    stock_name: str,
+    buy_price: float,
+    shares: int,
+    buy_time: str,
+    total_cost: float,
+    financed_principal: float,
+    leverage: float,
+    fee_daily_rate_pct: float,
+    held_days: float,
+    note: str,
+    actor: str,
+) -> None:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE margin_positions
+        SET stock_code = ?, stock_name = ?, buy_price = ?, shares = ?, buy_time = ?, total_cost = ?,
+            financed_principal = ?, leverage = ?, fee_daily_rate_pct = ?, held_days = ?, note = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            normalize_code(stock_code),
+            stock_name,
+            buy_price,
+            shares,
+            buy_time,
+            total_cost,
+            financed_principal,
+            leverage,
+            fee_daily_rate_pct,
+            held_days,
+            note,
+            now_str(),
+            position_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    log_action(actor, "修改融资持仓", str(position_id), f"{stock_code} / {shares}股")
 
 
 def delete_position(table_name: str, position_id: int, actor: str) -> None:
@@ -457,17 +618,101 @@ def get_audit_logs(limit: int = 100) -> List[sqlite3.Row]:
     return rows
 
 
-# -------------------------
-# 行情
-# -------------------------
+def create_session(user_id: int, remember_minutes: int) -> Tuple[str, str]:
+    token = str(uuid.uuid4())
+    expires_at = (datetime.now() + timedelta(minutes=remember_minutes)).isoformat()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO user_sessions (user_id, session_token, expires_at, is_active, created_at, updated_at)
+        VALUES (?, ?, ?, 1, ?, ?)
+        """,
+        (user_id, token, expires_at, now_str(), now_str()),
+    )
+    conn.commit()
+    conn.close()
+    return token, expires_at
+
+
+def get_valid_session(token: str) -> Optional[sqlite3.Row]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT s.*, u.login_name, u.display_name, u.role, u.mode
+        FROM user_sessions s
+        JOIN users u ON s.user_id = u.id
+        WHERE s.session_token = ? AND s.is_active = 1 AND u.is_active = 1
+        """,
+        (token,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        if datetime.now() >= datetime.fromisoformat(row["expires_at"]):
+            return None
+    except Exception:
+        return None
+    return row
+
+
+def invalidate_session(token: str) -> None:
+    if not token:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE user_sessions SET is_active = 0, updated_at = ? WHERE session_token = ?", (now_str(), token))
+    conn.commit()
+    conn.close()
+
+
+def _quote_from_eastmoney(code: str) -> Tuple[str, float, float]:
+    code = normalize_code(code)
+    secid = f"1.{code}" if code.startswith(("60", "68", "90", "51", "58")) else f"0.{code}"
+    url = "https://push2.eastmoney.com/api/qt/stock/get"
+    params = {"secid": secid, "fields": "f57,f58,f43,f46", "invt": "2", "fltt": "2"}
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
+    r = requests.get(url, params=params, headers=headers, timeout=8)
+    r.raise_for_status()
+    data = r.json().get("data") or {}
+    stock_name = str(data.get("f58") or code)
+    current_price = safe_float(data.get("f43"), 0.0) / 100
+    open_price = safe_float(data.get("f46"), 0.0) / 100
+    if current_price <= 0:
+        raise RuntimeError("东方财富接口当前价格无效")
+    return stock_name, current_price, open_price
+
+
+def _quote_from_tencent(code: str) -> Tuple[str, float, float]:
+    code = normalize_code(code)
+    symbol = f"{get_market_prefix(code)}{code}"
+    url = f"https://qt.gtimg.cn/q={symbol}"
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"}
+    r = requests.get(url, headers=headers, timeout=8)
+    r.raise_for_status()
+    r.encoding = "gbk"
+    text = r.text.strip()
+    if "~" not in text:
+        raise RuntimeError("腾讯接口返回格式异常")
+    parts = text.split("~")
+    if len(parts) < 6:
+        raise RuntimeError("腾讯接口字段不足")
+    stock_name = parts[1].strip() or code
+    current_price = safe_float(parts[3], 0.0)
+    open_price = safe_float(parts[5], 0.0)
+    if current_price <= 0:
+        raise RuntimeError("腾讯接口当前价格无效")
+    return stock_name, current_price, open_price
+
+
 def _quote_from_sina(code: str) -> Tuple[str, float, float]:
     code = normalize_code(code)
     symbol = f"{get_market_prefix(code)}{code}"
     url = f"https://hq.sinajs.cn/list={symbol}"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://finance.sina.com.cn",
-    }
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn"}
     r = requests.get(url, headers=headers, timeout=8)
     r.raise_for_status()
     r.encoding = "gbk"
@@ -488,59 +733,9 @@ def _quote_from_sina(code: str) -> Tuple[str, float, float]:
     return stock_name, current_price, open_price
 
 
-def _quote_from_tencent(code: str) -> Tuple[str, float, float]:
-    code = normalize_code(code)
-    symbol = f"{get_market_prefix(code)}{code}"
-    url = f"https://qt.gtimg.cn/q={symbol}"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://gu.qq.com/",
-    }
-    r = requests.get(url, headers=headers, timeout=8)
-    r.raise_for_status()
-    r.encoding = "gbk"
-    text = r.text.strip()
-    if "~" not in text:
-        raise RuntimeError("腾讯接口返回格式异常")
-    parts = text.split("~")
-    if len(parts) < 6:
-        raise RuntimeError("腾讯接口字段不足")
-    stock_name = parts[1].strip() or code
-    current_price = safe_float(parts[3], 0.0)
-    open_price = safe_float(parts[5], 0.0)
-    if current_price <= 0:
-        raise RuntimeError("腾讯接口当前价格无效")
-    return stock_name, current_price, open_price
-
-
-def _quote_from_eastmoney(code: str) -> Tuple[str, float, float]:
-    code = normalize_code(code)
-    secid = f"1.{code}" if code.startswith(("60", "68", "90", "51", "58")) else f"0.{code}"
-    url = "https://push2.eastmoney.com/api/qt/stock/get"
-    params = {
-        "secid": secid,
-        "fields": "f57,f58,f43,f46",
-        "invt": "2",
-        "fltt": "2",
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://quote.eastmoney.com/",
-    }
-    r = requests.get(url, params=params, headers=headers, timeout=8)
-    r.raise_for_status()
-    data = r.json().get("data") or {}
-    stock_name = str(data.get("f58") or code)
-    current_price = safe_float(data.get("f43"), 0.0) / 100
-    open_price = safe_float(data.get("f46"), 0.0) / 100
-    if current_price <= 0:
-        raise RuntimeError("东方财富接口当前价格无效")
-    return stock_name, current_price, open_price
-
-
 def get_realtime_quote(code: str) -> Tuple[str, float, float]:
     errors = []
-    for fn in (_quote_from_tencent, _quote_from_eastmoney, _quote_from_sina):
+    for fn in (_quote_from_eastmoney, _quote_from_tencent, _quote_from_sina):
         try:
             return fn(code)
         except Exception as e:
@@ -548,14 +743,11 @@ def get_realtime_quote(code: str) -> Tuple[str, float, float]:
     raise RuntimeError("；".join(errors))
 
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=2)
 def cached_quote(code: str) -> Tuple[str, float, float]:
     return get_realtime_quote(code)
 
 
-# -------------------------
-# 计算
-# -------------------------
 def calculate_metrics(
     stock_code: str,
     stock_name: str,
@@ -652,73 +844,67 @@ def calculate_risk_line_info(total_cost: float, current_price: float, shares: in
     }
 
 
-# -------------------------
-# UI小组件
-# -------------------------
-def render_big_card(label: str, value: str, class_name: str = "neutral", badge: Optional[str] = None):
-    badge_html = f'<div style="margin-top:8px">{badge}</div>' if badge else ""
-    st.markdown(
-        f'''
-        <div class="card">
-            <div class="kpi-label">{label}</div>
-            <div class="kpi-value {class_name}">{value}</div>
-            {badge_html}
-        </div>
-        ''',
-        unsafe_allow_html=True,
-    )
+def get_cookie_manager():
+    if "cookie_manager" not in st.session_state:
+        st.session_state.cookie_manager = stx.CookieManager()
+    return st.session_state.cookie_manager
 
 
-def render_small_card(label: str, value: str, class_name: str = "neutral"):
-    st.markdown(
-        f'''
-        <div class="card">
-            <div class="kpi-label">{label}</div>
-            <div class="kpi-small {class_name}">{value}</div>
-        </div>
-        ''',
-        unsafe_allow_html=True,
-    )
-
-
-def render_login_hero():
-    st.markdown(
-        '''
-        <div class="hero">
-            <div class="big-title">📈 个人交易中心</div>
-            <div class="subtle">支持多账户登录、普通账户、融资账户、管理员后台和实时股票行情。</div>
-            <div style="margin-top:8px;"><span class="pill-blue">普通模式</span> <span class="pill-red">融资模式</span> <span class="pill-gray">管理员后台</span></div>
-        </div>
-        ''',
-        unsafe_allow_html=True,
-    )
-
-
-# -------------------------
-# 登录/会话
-# -------------------------
 def bootstrap_session_state():
     if "auth" not in st.session_state:
         st.session_state.auth = None
-    if "show_left_panel" not in st.session_state:
-        st.session_state.show_left_panel = True
+
+
+def try_restore_login_from_cookie():
+    bootstrap_session_state()
+    if st.session_state.auth:
+        return
+
+    cookie_manager = get_cookie_manager()
+    token = cookie_manager.get(AUTH_COOKIE_NAME)
+    if not token:
+        return
+
+    session_row = get_valid_session(token)
+    if not session_row:
+        try:
+            cookie_manager.delete(AUTH_COOKIE_NAME)
+        except Exception:
+            pass
+        return
+
+    st.session_state.auth = {
+        "user_id": session_row["user_id"],
+        "login_name": session_row["login_name"],
+        "display_name": session_row["display_name"],
+        "role": session_row["role"],
+        "mode": session_row["mode"],
+        "expires_at": session_row["expires_at"],
+    }
 
 
 def is_auth_valid() -> bool:
     auth = st.session_state.get("auth")
     if not auth:
         return False
-    expires_at = auth.get("expires_at")
-    if not expires_at:
-        return False
     try:
-        return datetime.now() < datetime.fromisoformat(expires_at)
+        return datetime.now() < datetime.fromisoformat(auth["expires_at"])
     except Exception:
         return False
 
 
 def login_user(user_row: sqlite3.Row, remember_minutes: int):
-    expires_at = (datetime.now() + timedelta(minutes=remember_minutes)).isoformat()
+    token, expires_at = create_session(user_row["id"], remember_minutes)
+    cookie_manager = get_cookie_manager()
+    try:
+        cookie_manager.set(
+            AUTH_COOKIE_NAME,
+            token,
+            expires_at=datetime.now() + timedelta(minutes=remember_minutes),
+        )
+    except Exception:
+        pass
+
     st.session_state.auth = {
         "user_id": user_row["id"],
         "login_name": user_row["login_name"],
@@ -726,11 +912,18 @@ def login_user(user_row: sqlite3.Row, remember_minutes: int):
         "role": user_row["role"],
         "mode": user_row["mode"],
         "expires_at": expires_at,
-        "remember_minutes": remember_minutes,
     }
 
 
 def logout_user():
+    cookie_manager = get_cookie_manager()
+    token = cookie_manager.get(AUTH_COOKIE_NAME)
+    if token:
+        invalidate_session(token)
+    try:
+        cookie_manager.delete(AUTH_COOKIE_NAME)
+    except Exception:
+        pass
     st.session_state.auth = None
     st.rerun()
 
@@ -742,8 +935,7 @@ def current_user() -> Optional[dict]:
 
 
 def check_login() -> bool:
-    bootstrap_session_state()
-
+    try_restore_login_from_cookie()
     if is_auth_valid():
         return True
 
@@ -752,7 +944,6 @@ def check_login() -> bool:
 
     users = get_all_users()
     user_choices = [u["login_name"] for u in users]
-    default_user = user_choices[0] if user_choices else ""
 
     c1, c2, c3 = st.columns([1.1, 1.2, 1.1])
     with c2:
@@ -765,31 +956,164 @@ def check_login() -> bool:
             user_row = get_user_by_login(selected_user)
             if not user_row:
                 st.error("该用户不存在或已停用。")
+            elif hash_password(password) == user_row["password_hash"]:
+                remember_minutes = SESSION_MINUTES_MAP[remember_choice]
+                login_user(user_row, remember_minutes)
+                log_action(user_row["login_name"], "登录系统", user_row["login_name"], f"记住{remember_minutes}分钟")
+                st.success("登录成功")
+                st.rerun()
             else:
-                if hash_password(password) == user_row["password_hash"]:
-                    remember_minutes = SESSION_MINUTES_MAP[remember_choice]
-                    login_user(user_row, remember_minutes)
-                    log_action(user_row["login_name"], "登录系统", user_row["login_name"], f"记住{remember_minutes}分钟")
-                    st.success("登录成功")
-                    st.rerun()
-                else:
-                    st.error("密码错误")
-
-        st.markdown('</div>', unsafe_allow_html=True)
+                st.error("密码错误")
+        st.markdown("</div>", unsafe_allow_html=True)
     return False
 
 
-# -------------------------
-# 管理后台
-# -------------------------
+def topbar(user: dict):
+    c1, c2 = st.columns([5, 1])
+    with c1:
+        st.markdown('<div class="big-title">📈 个人交易中心</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="subtle">当前登录：{user["display_name"]} · {mode_label(user["mode"])}</div>', unsafe_allow_html=True)
+    with c2:
+        if st.button("退出登录", use_container_width=True):
+            logout_user()
+
+
+def sidebar_common(user: dict):
+    with st.sidebar:
+        st.markdown('<div class="section-title">系统设置</div>', unsafe_allow_html=True)
+        if st.button("清缓存并刷新价格", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+        st.markdown("---")
+        st.markdown(f'<div class="hint">数据库路径：{DB_PATH}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="hint">当前用户：{user["display_name"]}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="hint">当前模式：{mode_label(user["mode"])}</div>', unsafe_allow_html=True)
+
+
+def render_normal_position_card(row: sqlite3.Row):
+    stock_name = row["stock_name"] or row["stock_code"]
+    current_price = 0.0
+    open_price = 0.0
+    quote_ok = False
+    try:
+        stock_name, current_price, open_price = cached_quote(row["stock_code"])
+        quote_ok = True
+    except Exception:
+        pass
+
+    buy_price = safe_float(row["buy_price"], 0.0)
+    shares = int(row["shares"] or 0)
+    total_cost = safe_float(row["total_cost"], buy_price * shares)
+    market_value = current_price * shares if quote_ok else 0.0
+    total_profit = market_value - total_cost if quote_ok else 0.0
+    total_profit_pct = (total_profit / total_cost * 100) if total_cost > 0 and quote_ok else 0.0
+    daily_profit = (current_price - open_price) * shares if quote_ok and open_price > 0 else 0.0
+    daily_profit_pct = ((current_price - open_price) / open_price * 100) if quote_ok and open_price > 0 else 0.0
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown(f'**{stock_name}（{row["stock_code"]}）**')
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("现价", f"{current_price:.4f}" if quote_ok else "--")
+    c2.metric("总盈亏", money(total_profit), delta=pct(total_profit_pct))
+    c3.metric("当日浮盈亏", money(daily_profit), delta=pct(daily_profit_pct))
+    c4.metric("总成本", money(total_cost))
+    st.caption(f'买入价：{buy_price:.4f} ｜ 股数：{shares:,} ｜ 买入时间：{row["buy_time"] or "--"}')
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_margin_position_card(row: sqlite3.Row):
+    stock_name = row["stock_name"] or row["stock_code"]
+    current_price = 0.0
+    try:
+        stock_name, current_price, _ = cached_quote(row["stock_code"])
+    except Exception:
+        pass
+
+    metrics = calculate_metrics(
+        stock_code=row["stock_code"],
+        stock_name=stock_name,
+        buy_price=row["buy_price"],
+        current_price=current_price,
+        shares=int(row["shares"] or 0),
+        override_total_cost_enabled=True,
+        override_total_cost=row["total_cost"],
+        financed_principal=row["financed_principal"],
+        leverage=row["leverage"],
+        fee_daily_rate_pct=row["fee_daily_rate_pct"],
+        held_days=row["held_days"],
+    )
+
+    warning_70 = calculate_risk_line_info(metrics.total_cost, metrics.current_price, metrics.shares, metrics.financed_principal, 0.70, metrics.profit_loss)
+    liq_80 = calculate_risk_line_info(metrics.total_cost, metrics.current_price, metrics.shares, metrics.financed_principal, 0.80, metrics.profit_loss)
+
+    if warning_70["triggered"]:
+        warning_70_text = "已触发"
+    else:
+        warning_70_text = f"还需下跌 {pct(warning_70['additional_drop_pct'])} / {money(warning_70['additional_drop_price'])}"
+
+    if liq_80["triggered"]:
+        liq_80_text = "已触发"
+    else:
+        liq_80_text = f"还需下跌 {pct(liq_80['additional_drop_pct'])} / {money(liq_80['additional_drop_price'])}"
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown(f'**{stock_name}（{row["stock_code"]}）**')
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("现价", f"{metrics.current_price:.4f}" if metrics.current_price > 0 else "--")
+    c2.metric("浮盈亏", money(metrics.profit_loss), delta=pct(metrics.profit_loss_pct))
+    c3.metric("配资本金", money(metrics.financed_principal))
+    c4.metric("累计利息", money(metrics.accumulated_fee))
+    c5, c6 = st.columns(2)
+    with c5:
+        st.caption(f"70%线：{warning_70_text}")
+    with c6:
+        st.caption(f"80%线：{liq_80_text}")
+    st.caption(f'买入价：{metrics.buy_price:.4f} ｜ 股数：{metrics.shares:,} ｜ 杠杆：{metrics.leverage:.2f} ｜ 买入时间：{row["buy_time"] or "--"}')
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def multi_account_overview(user: dict):
+    if st_autorefresh is not None:
+        st_autorefresh(interval=2000, key="admin_overview_refresh")
+
+    st.markdown('<div class="section-title">多账户总览</div>', unsafe_allow_html=True)
+    users = [u for u in get_all_users() if u["role"] != "admin"]
+    selected_users = st.multiselect(
+        "选择要查看的账户",
+        [u["login_name"] for u in users],
+        default=[u["login_name"] for u in users],
+    )
+
+    if not selected_users:
+        st.info("请选择至少一个账户。")
+        return
+
+    selected_rows = [u for u in users if u["login_name"] in selected_users]
+    for u in selected_rows:
+        st.markdown(f'<div class="section-title">{u["display_name"]} · {mode_label(u["mode"])}</div>', unsafe_allow_html=True)
+        if u["mode"] == "margin":
+            rows = get_user_positions_margin(u["id"])
+            if rows:
+                for row in rows:
+                    render_margin_position_card(row)
+            else:
+                st.info("暂无融资持仓。")
+        else:
+            rows = get_user_positions_normal(u["id"])
+            if rows:
+                for row in rows:
+                    render_normal_position_card(row)
+            else:
+                st.info("暂无普通持仓。")
+
+
 def admin_panel(user: dict):
-    st.markdown('<div class="big-title">⚙️ 管理后台</div>', unsafe_allow_html=True)
-    st.markdown('<div class="subtle">管理员可以管理用户、录入普通账户持仓、录入融资账户持仓，并查看操作日志。</div>', unsafe_allow_html=True)
+    tabs = st.tabs(["多账户总览", "用户管理", "普通账户持仓管理", "融资账户持仓管理", "操作日志"])
 
-    tabs = st.tabs(["用户管理", "普通账户持仓管理", "融资账户持仓管理", "操作日志"])
-
-    # 用户管理
     with tabs[0]:
+        multi_account_overview(user)
+
+    with tabs[1]:
         left, right = st.columns([1, 1.2])
         with left:
             st.markdown('<div class="section-title">新增用户</div>', unsafe_allow_html=True)
@@ -800,56 +1124,44 @@ def admin_panel(user: dict):
             new_mode = st.selectbox("账户模式", ["normal", "margin"], format_func=lambda x: "普通模式" if x == "normal" else "融资模式")
             if st.button("新增用户", type="primary"):
                 ok, msg = create_user(new_login, new_display, new_password, new_role, new_mode, user["login_name"])
+                st.success(msg) if ok else st.error(msg)
                 if ok:
-                    st.success(msg)
                     st.rerun()
-                else:
-                    st.error(msg)
 
         with right:
-            st.markdown('<div class="section-title">用户列表与编辑</div>', unsafe_allow_html=True)
             users = get_all_users()
             if users:
-                df = pd.DataFrame([
-                    {
-                        "登录名": u["login_name"],
-                        "显示名": u["display_name"],
-                        "角色": u["role"],
-                        "模式": mode_label(u["mode"]),
-                        "创建时间": u["created_at"],
-                    }
-                    for u in users
-                ])
+                df = pd.DataFrame(
+                    [{"登录名": u["login_name"], "显示名": u["display_name"], "角色": u["role"], "模式": mode_label(u["mode"]), "创建时间": u["created_at"]} for u in users]
+                )
                 st.dataframe(df, use_container_width=True, hide_index=True)
 
                 selected = st.selectbox("选择要编辑的用户", [u["login_name"] for u in users])
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    reset_pwd = st.text_input("新密码", type="password", key="admin_reset_pwd")
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    new_pwd = st.text_input("新密码", type="password", key="admin_new_pwd")
                     if st.button("修改密码"):
-                        ok, msg = update_user_password(selected, reset_pwd, user["login_name"])
+                        ok, msg = update_user_password(selected, new_pwd, user["login_name"])
                         st.success(msg) if ok else st.error(msg)
-                with col2:
-                    mode_val = st.selectbox("切换模式", ["normal", "margin"], key="admin_user_mode", format_func=lambda x: "普通模式" if x == "normal" else "融资模式")
+                with c2:
+                    mode_val = st.selectbox("切换模式", ["normal", "margin"], format_func=lambda x: "普通模式" if x == "normal" else "融资模式")
                     if st.button("修改模式"):
                         ok, msg = update_user_mode(selected, mode_val, user["login_name"])
                         st.success(msg) if ok else st.error(msg)
-                with col3:
+                with c3:
                     if st.button("停用用户"):
                         ok, msg = delete_user(selected, user["login_name"])
                         st.success(msg) if ok else st.error(msg)
                         if ok:
                             st.rerun()
 
-    # 普通账户持仓管理
-    with tabs[1]:
+    with tabs[2]:
         normal_users = [u for u in get_all_users() if u["mode"] == "normal"]
-        if not normal_users:
-            st.info("当前没有普通账户用户。")
-        else:
-            target_login = st.selectbox("选择普通账户用户", [u["login_name"] for u in normal_users], key="admin_normal_target")
+        if normal_users:
+            target_login = st.selectbox("选择普通账户用户", [u["login_name"] for u in normal_users], key="normal_target")
             target_user = get_user_by_login(target_login)
-            st.markdown('<div class="section-title">新增普通账户持仓</div>', unsafe_allow_html=True)
+
+            st.markdown('<div class="section-title">新增普通持仓</div>', unsafe_allow_html=True)
             c1, c2, c3 = st.columns(3)
             with c1:
                 n_code = st.text_input("股票代码", key="n_code")
@@ -857,12 +1169,13 @@ def admin_panel(user: dict):
                 n_buy_time = st.text_input("买入时间", value=now_str(), key="n_buy_time")
             with c2:
                 n_shares = st.number_input("买入股数", min_value=0, step=100, key="n_shares")
-                n_total_cost = st.number_input("总成本", min_value=0.0, step=100.0, format="%.2f", key="n_total_cost")
+                n_total_cost = n_buy_price * int(n_shares)
+                st.number_input("总成本（自动计算）", min_value=0.0, value=float(n_total_cost), step=100.0, format="%.2f", disabled=True, key="n_total_cost_display")
                 n_note = st.text_input("备注", key="n_note")
             with c3:
                 st.write("")
                 st.write("")
-                if st.button("保存普通账户持仓", type="primary"):
+                if st.button("保存普通持仓", type="primary"):
                     stock_name = normalize_code(n_code)
                     try:
                         stock_name, _, _ = cached_quote(n_code)
@@ -874,34 +1187,51 @@ def admin_panel(user: dict):
 
             rows = get_user_positions_normal(target_user["id"])
             if rows:
-                df = pd.DataFrame([
-                    {
-                        "ID": r["id"],
-                        "股票代码": r["stock_code"],
-                        "股票名称": r["stock_name"],
-                        "买入价格": r["buy_price"],
-                        "股数": r["shares"],
-                        "买入时间": r["buy_time"],
-                        "总成本": r["total_cost"],
-                        "备注": r["note"],
-                    } for r in rows
-                ])
+                df = pd.DataFrame(
+                    [{"ID": r["id"], "股票代码": r["stock_code"], "股票名称": r["stock_name"], "买入价格": r["buy_price"], "股数": r["shares"], "买入时间": r["buy_time"], "总成本": r["total_cost"], "备注": r["note"]} for r in rows]
+                )
                 st.dataframe(df, use_container_width=True, hide_index=True)
+
+                st.markdown('<div class="section-title">编辑普通持仓</div>', unsafe_allow_html=True)
+                edit_id = st.selectbox("选择普通持仓ID", [r["id"] for r in rows], key="edit_normal_id")
+                selected_row = next(r for r in rows if r["id"] == edit_id)
+
+                e1, e2, e3 = st.columns(3)
+                with e1:
+                    en_code = st.text_input("股票代码", value=selected_row["stock_code"], key="en_code")
+                    en_buy_price = st.number_input("买入价格", min_value=0.0, step=0.01, format="%.4f", value=float(selected_row["buy_price"]), key="en_buy_price")
+                    en_buy_time = st.text_input("买入时间", value=str(selected_row["buy_time"] or ""), key="en_buy_time")
+                with e2:
+                    en_shares = st.number_input("买入股数", min_value=0, step=100, value=int(selected_row["shares"]), key="en_shares")
+                    en_total_cost = en_buy_price * int(en_shares)
+                    st.number_input("总成本（自动计算）", min_value=0.0, value=float(en_total_cost), step=100.0, format="%.2f", disabled=True, key="en_total_cost")
+                    en_note = st.text_input("备注", value=str(selected_row["note"] or ""), key="en_note")
+                with e3:
+                    st.write("")
+                    st.write("")
+                    if st.button("保存普通持仓修改", type="primary"):
+                        stock_name = normalize_code(en_code)
+                        try:
+                            stock_name, _, _ = cached_quote(en_code)
+                        except Exception:
+                            pass
+                        update_normal_position(edit_id, en_code, stock_name, en_buy_price, int(en_shares), en_buy_time, en_total_cost, en_note, user["login_name"])
+                        st.success("普通持仓修改成功。")
+                        st.rerun()
+
                 delete_id = st.selectbox("删除普通持仓ID", [r["id"] for r in rows], key="delete_normal_id")
                 if st.button("删除该普通持仓"):
                     delete_position("normal_positions", int(delete_id), user["login_name"])
                     st.success("普通持仓已删除。")
                     st.rerun()
 
-    # 融资账户持仓管理
-    with tabs[2]:
+    with tabs[3]:
         margin_users = [u for u in get_all_users() if u["mode"] == "margin"]
-        if not margin_users:
-            st.info("当前没有融资账户用户。")
-        else:
-            target_login = st.selectbox("选择融资账户用户", [u["login_name"] for u in margin_users], key="admin_margin_target")
+        if margin_users:
+            target_login = st.selectbox("选择融资账户用户", [u["login_name"] for u in margin_users], key="margin_target")
             target_user = get_user_by_login(target_login)
-            st.markdown('<div class="section-title">新增融资账户持仓</div>', unsafe_allow_html=True)
+
+            st.markdown('<div class="section-title">新增融资持仓</div>', unsafe_allow_html=True)
             c1, c2, c3 = st.columns(3)
             with c1:
                 m_code = st.text_input("股票代码", key="m_code")
@@ -909,80 +1239,86 @@ def admin_panel(user: dict):
                 m_buy_time = st.text_input("买入时间", value=now_str(), key="m_buy_time")
                 m_shares = st.number_input("买入股数", min_value=0, step=100, key="m_shares")
             with c2:
-                m_total_cost = st.number_input("总成本", min_value=0.0, step=100.0, format="%.2f", key="m_total_cost")
+                m_total_cost = m_buy_price * int(m_shares)
+                st.number_input("总成本（自动计算）", min_value=0.0, value=float(m_total_cost), step=100.0, format="%.2f", disabled=True, key="m_total_cost_display")
                 m_financed = st.number_input("配资本金", min_value=0.0, step=1000.0, format="%.2f", key="m_financed")
                 m_leverage = st.number_input("杠杆", min_value=0.0, step=1.0, format="%.2f", key="m_leverage")
+            with c3:
                 m_fee = st.number_input("日利息(%)", min_value=0.0, step=0.01, format="%.4f", key="m_fee")
                 m_days = st.number_input("持仓天数", min_value=0.0, step=1.0, format="%.2f", key="m_days")
-            with c3:
                 m_note = st.text_input("备注", key="m_note")
-                st.write("")
-                if st.button("保存融资账户持仓", type="primary"):
+                if st.button("保存融资持仓", type="primary"):
                     stock_name = normalize_code(m_code)
                     try:
                         stock_name, _, _ = cached_quote(m_code)
                     except Exception:
                         pass
                     save_margin_position(target_user["id"], m_code, stock_name, m_buy_price, int(m_shares), m_buy_time, m_total_cost, m_financed, m_leverage, m_fee, m_days, m_note, user["login_name"])
-                    st.success("融资账户持仓已保存。")
+                    st.success("融资持仓已保存。")
                     st.rerun()
 
             rows = get_user_positions_margin(target_user["id"])
             if rows:
-                df = pd.DataFrame([
-                    {
-                        "ID": r["id"],
-                        "股票代码": r["stock_code"],
-                        "股票名称": r["stock_name"],
-                        "买入价格": r["buy_price"],
-                        "股数": r["shares"],
-                        "总成本": r["total_cost"],
-                        "配资本金": r["financed_principal"],
-                        "杠杆": r["leverage"],
-                        "日利息": r["fee_daily_rate_pct"],
-                        "持仓天数": r["held_days"],
-                    } for r in rows
-                ])
+                df = pd.DataFrame(
+                    [{"ID": r["id"], "股票代码": r["stock_code"], "股票名称": r["stock_name"], "买入价格": r["buy_price"], "股数": r["shares"], "总成本": r["total_cost"], "配资本金": r["financed_principal"], "杠杆": r["leverage"], "日利息": r["fee_daily_rate_pct"], "持仓天数": r["held_days"]} for r in rows]
+                )
                 st.dataframe(df, use_container_width=True, hide_index=True)
+
+                st.markdown('<div class="section-title">编辑融资持仓</div>', unsafe_allow_html=True)
+                edit_id = st.selectbox("选择融资持仓ID", [r["id"] for r in rows], key="edit_margin_id")
+                selected_row = next(r for r in rows if r["id"] == edit_id)
+
+                e1, e2, e3 = st.columns(3)
+                with e1:
+                    em_code = st.text_input("股票代码", value=selected_row["stock_code"], key="em_code")
+                    em_buy_price = st.number_input("买入价格", min_value=0.0, step=0.01, format="%.4f", value=float(selected_row["buy_price"]), key="em_buy_price")
+                    em_buy_time = st.text_input("买入时间", value=str(selected_row["buy_time"] or ""), key="em_buy_time")
+                    em_shares = st.number_input("买入股数", min_value=0, step=100, value=int(selected_row["shares"]), key="em_shares")
+                with e2:
+                    em_total_cost = em_buy_price * int(em_shares)
+                    st.number_input("总成本（自动计算）", min_value=0.0, value=float(em_total_cost), step=100.0, format="%.2f", disabled=True, key="em_total_cost")
+                    em_financed = st.number_input("配资本金", min_value=0.0, step=1000.0, format="%.2f", value=float(selected_row["financed_principal"]), key="em_financed")
+                    em_leverage = st.number_input("杠杆", min_value=0.0, step=1.0, format="%.2f", value=float(selected_row["leverage"]), key="em_leverage")
+                with e3:
+                    em_fee = st.number_input("日利息(%)", min_value=0.0, step=0.01, format="%.4f", value=float(selected_row["fee_daily_rate_pct"]), key="em_fee")
+                    em_days = st.number_input("持仓天数", min_value=0.0, step=1.0, format="%.2f", value=float(selected_row["held_days"]), key="em_days")
+                    em_note = st.text_input("备注", value=str(selected_row["note"] or ""), key="em_note")
+                    if st.button("保存融资持仓修改", type="primary"):
+                        stock_name = normalize_code(em_code)
+                        try:
+                            stock_name, _, _ = cached_quote(em_code)
+                        except Exception:
+                            pass
+                        update_margin_position(edit_id, em_code, stock_name, em_buy_price, int(em_shares), em_buy_time, em_total_cost, em_financed, em_leverage, em_fee, em_days, em_note, user["login_name"])
+                        st.success("融资持仓修改成功。")
+                        st.rerun()
+
                 delete_id = st.selectbox("删除融资持仓ID", [r["id"] for r in rows], key="delete_margin_id")
                 if st.button("删除该融资持仓"):
                     delete_position("margin_positions", int(delete_id), user["login_name"])
                     st.success("融资持仓已删除。")
                     st.rerun()
 
-    # 日志
-    with tabs[3]:
+    with tabs[4]:
         logs = get_audit_logs(200)
         if logs:
-            df = pd.DataFrame([
-                {
-                    "时间": r["created_at"],
-                    "操作者": r["actor_login"],
-                    "动作": r["action"],
-                    "目标": r["target_login"],
-                    "详情": r["details"],
-                } for r in logs
-            ])
+            df = pd.DataFrame(
+                [{"时间": r["created_at"], "操作者": r["actor_login"], "动作": r["action"], "目标": r["target_login"], "详情": r["details"]} for r in logs]
+            )
             st.dataframe(df, use_container_width=True, hide_index=True)
         else:
             st.info("暂无日志。")
 
 
-# -------------------------
-# 普通账户系统
-# -------------------------
 def normal_system(user: dict):
-    st.markdown(f'<div class="big-title">📊 普通股票系统</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="subtle">当前用户：{user["display_name"]} · 普通账户 · 实时行情与持仓盈亏</div>', unsafe_allow_html=True)
+    if st_autorefresh is not None:
+        st_autorefresh(interval=2000, key=f'normal_auto_{user["user_id"]}')
 
+    st.markdown('<div class="section-title">普通股票系统</div>', unsafe_allow_html=True)
     positions = get_user_positions_normal(user["user_id"])
     if not positions:
-        st.warning("当前没有持仓数据。请让管理员在后台先录入普通账户持仓。")
+        st.warning("当前没有持仓数据。请让管理员先录入普通账户持仓。")
         return
-
-    if st.sidebar.checkbox("开启自动刷新", value=False) and st_autorefresh is not None:
-        sec = st.sidebar.slider("刷新间隔（秒）", 5, 60, 10, key="normal_refresh")
-        st_autorefresh(interval=sec * 1000, key="normal_auto_refresh")
 
     options = [f'{p["stock_name"] or p["stock_code"]}（{p["stock_code"]}）- ID {p["id"]}' for p in positions]
     idx = st.selectbox("选择持仓", range(len(options)), format_func=lambda i: options[i])
@@ -1007,67 +1343,52 @@ def normal_system(user: dict):
     daily_profit = (current_price - open_price) * shares if quote_ok and open_price > 0 else 0.0
     daily_profit_pct = ((current_price - open_price) / open_price * 100) if quote_ok and open_price > 0 else 0.0
 
-    c1, c2 = st.columns([1.1, 1])
+    c1, c2 = st.columns([1, 1])
     with c1:
         render_big_card("股票名称", f"{stock_name}（{row['stock_code']}）")
     with c2:
         render_big_card("总盈亏", f"{money(total_profit)}  ({pct(total_profit_pct)})", pnl_class(total_profit), pnl_badge(total_profit))
 
     r1, r2, r3 = st.columns(3)
-    with r1:
-        render_small_card("现价", f"{current_price:.4f}" if quote_ok else "--")
-    with r2:
-        render_small_card("买入价格", f"{buy_price:.4f}")
-    with r3:
-        render_small_card("买入时间", str(row["buy_time"] or "--"))
+    r1.metric("现价", f"{current_price:.4f}" if quote_ok else "--")
+    r2.metric("总成本", money(total_cost))
+    r3.metric("股票市值", money(market_value) if quote_ok else "--")
 
     r4, r5, r6 = st.columns(3)
-    with r4:
-        render_small_card("股数", f"{shares:,}")
-    with r5:
-        render_small_card("总成本", money(total_cost))
-    with r6:
-        render_small_card("股票市值", money(market_value) if quote_ok else "--")
+    r4.metric("买入价", f"{buy_price:.4f}")
+    r5.metric("买入股数", f"{shares:,}")
+    r6.metric("买入时间", str(row["buy_time"] or "--"))
 
-    r7, r8 = st.columns(2)
-    with r7:
-        render_big_card("当日浮盈 / 浮亏", f"{money(daily_profit)}  ({pct(daily_profit_pct)})", pnl_class(daily_profit), pnl_badge(daily_profit))
-    with r8:
-        note_badge = '<span class="pill-blue">普通账户</span>'
-        render_big_card("备注", str(row["note"] or "无备注"), "neutral", note_badge)
+    render_big_card("当日浮盈 / 浮亏", f"{money(daily_profit)}  ({pct(daily_profit_pct)})", pnl_class(daily_profit), pnl_badge(daily_profit))
 
-    details = pd.DataFrame([
-        ["股票代码", row["stock_code"]],
-        ["股票名称", stock_name],
-        ["买入价格", buy_price],
-        ["当前价格", current_price if quote_ok else None],
-        ["开盘价格", open_price if quote_ok else None],
-        ["买入股数", shares],
-        ["买入时间", row["buy_time"]],
-        ["总成本", total_cost],
-        ["股票市值", market_value if quote_ok else None],
-        ["总盈亏", total_profit if quote_ok else None],
-        ["当日浮盈/浮亏", daily_profit if quote_ok else None],
-        ["备注", row["note"]],
-    ], columns=["项目", "数值"])
+    details = pd.DataFrame(
+        [
+            ["股票代码", row["stock_code"]],
+            ["股票名称", stock_name],
+            ["买入价格", buy_price],
+            ["当前价格", current_price if quote_ok else None],
+            ["买入股数", shares],
+            ["买入时间", row["buy_time"]],
+            ["总成本", total_cost],
+            ["股票市值", market_value if quote_ok else None],
+            ["总盈亏", total_profit if quote_ok else None],
+            ["当日浮盈/浮亏", daily_profit if quote_ok else None],
+            ["备注", row["note"]],
+        ],
+        columns=["项目", "数值"],
+    )
     st.dataframe(details, use_container_width=True, hide_index=True)
 
 
-# -------------------------
-# 融资账户系统
-# -------------------------
 def margin_system(user: dict):
-    st.markdown(f'<div class="big-title">📉 融资交易系统</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="subtle">当前用户：{user["display_name"]} · 融资账户 · 杠杆、利息、风险线</div>', unsafe_allow_html=True)
+    if st_autorefresh is not None:
+        st_autorefresh(interval=2000, key=f'margin_auto_{user["user_id"]}')
 
+    st.markdown('<div class="section-title">融资交易系统</div>', unsafe_allow_html=True)
     positions = get_user_positions_margin(user["user_id"])
     if not positions:
-        st.warning("当前没有融资持仓数据。请让管理员在后台先录入融资持仓。")
+        st.warning("当前没有融资持仓数据。请让管理员先录入融资账户持仓。")
         return
-
-    if st.sidebar.checkbox("开启自动刷新", value=False) and st_autorefresh is not None:
-        sec = st.sidebar.slider("刷新间隔（秒）", 5, 60, 10, key="margin_refresh")
-        st_autorefresh(interval=sec * 1000, key="margin_auto_refresh")
 
     options = [f'{p["stock_name"] or p["stock_code"]}（{p["stock_code"]}）- ID {p["id"]}' for p in positions]
     idx = st.selectbox("选择融资持仓", range(len(options)), format_func=lambda i: options[i])
@@ -1095,101 +1416,72 @@ def margin_system(user: dict):
     )
 
     warning_70 = calculate_risk_line_info(metrics.total_cost, metrics.current_price, metrics.shares, metrics.financed_principal, 0.70, metrics.profit_loss)
-    liquidation_80 = calculate_risk_line_info(metrics.total_cost, metrics.current_price, metrics.shares, metrics.financed_principal, 0.80, metrics.profit_loss)
+    liq_80 = calculate_risk_line_info(metrics.total_cost, metrics.current_price, metrics.shares, metrics.financed_principal, 0.80, metrics.profit_loss)
 
-    r1, r2 = st.columns([1, 1])
-    with r1:
+    c1, c2 = st.columns([1, 1])
+    with c1:
         render_big_card("股票名称", f"{metrics.stock_name}（{metrics.stock_code}）")
-    with r2:
+    with c2:
         render_big_card("浮盈 / 浮亏", f"{money(metrics.profit_loss)}  ({pct(metrics.profit_loss_pct)})", pnl_class(metrics.profit_loss), pnl_badge(metrics.profit_loss))
 
-    a1, a2, a3 = st.columns(3)
-    with a1:
-        render_small_card("当前价格", f"{metrics.current_price:.4f}" if metrics.current_price > 0 else "--")
-    with a2:
-        render_small_card("总成本", money(metrics.total_cost))
-    with a3:
-        render_small_card("股票市值", money(metrics.market_value))
+    r1, r2, r3 = st.columns(3)
+    r1.metric("现价", f"{metrics.current_price:.4f}" if metrics.current_price > 0 else "--")
+    r2.metric("总成本", money(metrics.total_cost))
+    r3.metric("股票市值", money(metrics.market_value))
 
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        render_small_card("配资本金", money(metrics.financed_principal))
-    with b2:
-        render_small_card("总操盘资金", money(metrics.max_trading_capital))
-    with b3:
-        render_small_card("已用仓位", f"{money(metrics.used_position_amount)} ({pct(metrics.position_usage_pct)})")
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        render_small_card("亏损占配资本金", pct(metrics.loss_vs_financed_principal), "loss" if metrics.loss_vs_financed_principal > 0 else "neutral")
-    with c2:
-        render_small_card("当日手续费", money(metrics.daily_fee_amount))
-    with c3:
-        render_small_card("累计手续费", money(metrics.accumulated_fee))
+    r4, r5, r6 = st.columns(3)
+    r4.metric("配资本金", money(metrics.financed_principal))
+    r5.metric("杠杆", f"{metrics.leverage:.2f}")
+    r6.metric("累计手续费", money(metrics.accumulated_fee))
 
     render_big_card("扣费后净盈亏", f"{money(metrics.net_profit_after_fee)}  ({pct(metrics.net_profit_after_fee_pct_cost)})", pnl_class(metrics.net_profit_after_fee), pnl_badge(metrics.net_profit_after_fee))
 
-    st.markdown('<div class="section-title" style="margin-top:10px">风险线提示</div>', unsafe_allow_html=True)
     rr1, rr2 = st.columns(2)
     with rr1:
         if warning_70["triggered"]:
             render_big_card("提醒平仓线 70%", f"已触发（目标价 {warning_70['target_price']:.4f}）", "loss", '<span class="pill-red">已到提醒线</span>')
         else:
-            render_big_card("提醒平仓线 70%", f"下跌 {pct(warning_70['additional_drop_pct'])} / {money(warning_70['additional_drop_price'])}", "neutral", f'<span class="pill-gray">到价约 {warning_70["target_price"]:.4f}</span>')
-            st.caption(f"按当前仓位计算，再亏 {money(warning_70['remaining_loss_amount'])}，到 70% 提醒线。")
+            render_big_card(
+                "提醒平仓线 70%",
+                f"下跌 {pct(warning_70['additional_drop_pct'])} / {money(warning_70['additional_drop_price'])}",
+                "neutral",
+                f'<span class="pill-gray">到价约 {warning_70["target_price"]:.4f}</span>',
+            )
+
     with rr2:
-        if liquidation_80["triggered"]:
-            render_big_card("强平线 80%", f"已触发（目标价 {liquidation_80['target_price']:.4f}）", "loss", '<span class="pill-red">已到强平线</span>')
+        if liq_80["triggered"]:
+            render_big_card("强平线 80%", f"已触发（目标价 {liq_80['target_price']:.4f}）", "loss", '<span class="pill-red">已到强平线</span>')
         else:
-            render_big_card("强平线 80%", f"下跌 {pct(liquidation_80['additional_drop_pct'])} / {money(liquidation_80['additional_drop_price'])}", "neutral", f'<span class="pill-gray">到价约 {liquidation_80["target_price"]:.4f}</span>')
-            st.caption(f"按当前仓位计算，再亏 {money(liquidation_80['remaining_loss_amount'])}，到 80% 强平线。")
+            render_big_card(
+                "强平线 80%",
+                f"下跌 {pct(liq_80['additional_drop_pct'])} / {money(liq_80['additional_drop_price'])}",
+                "neutral",
+                f'<span class="pill-gray">到价约 {liq_80["target_price"]:.4f}</span>',
+            )
 
-    details = pd.DataFrame([
-        ["股票代码", metrics.stock_code],
-        ["股票名称", metrics.stock_name],
-        ["买入价格", metrics.buy_price],
-        ["买入时间", row["buy_time"]],
-        ["买入股数", metrics.shares],
-        ["总成本", metrics.total_cost],
-        ["当前价格", metrics.current_price],
-        ["股票市值", metrics.market_value],
-        ["浮盈/浮亏", metrics.profit_loss],
-        ["盈亏比例", metrics.profit_loss_pct],
-        ["配资本金", metrics.financed_principal],
-        ["杠杆", metrics.leverage],
-        ["总操盘资金", metrics.max_trading_capital],
-        ["已用仓位", metrics.used_position_amount],
-        ["亏损占配资本金", metrics.loss_vs_financed_principal],
-        ["每日费率(%)", metrics.fee_daily_rate_pct],
-        ["当日手续费", metrics.daily_fee_amount],
-        ["累计手续费", metrics.accumulated_fee],
-        ["备注", row["note"]],
-    ], columns=["项目", "数值"])
+    details = pd.DataFrame(
+        [
+            ["股票代码", metrics.stock_code],
+            ["股票名称", metrics.stock_name],
+            ["买入价格", metrics.buy_price],
+            ["买入时间", row["buy_time"]],
+            ["买入股数", metrics.shares],
+            ["总成本", metrics.total_cost],
+            ["当前价格", metrics.current_price],
+            ["股票市值", metrics.market_value],
+            ["浮盈/浮亏", metrics.profit_loss],
+            ["盈亏比例", metrics.profit_loss_pct],
+            ["配资本金", metrics.financed_principal],
+            ["杠杆", metrics.leverage],
+            ["亏损占配资本金", metrics.loss_vs_financed_principal],
+            ["日利息(%)", metrics.fee_daily_rate_pct],
+            ["当日手续费", metrics.daily_fee_amount],
+            ["累计手续费", metrics.accumulated_fee],
+            ["备注", row["note"]],
+        ],
+        columns=["项目", "数值"],
+    )
     st.dataframe(details, use_container_width=True, hide_index=True)
-
-
-# -------------------------
-# 主页面
-# -------------------------
-def topbar(user: dict):
-    c1, c2, c3 = st.columns([1.7, 1.2, 1])
-    with c1:
-        st.markdown(f'<div class="big-title">📈 个人交易中心</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="subtle">当前登录：{user["display_name"]} · {mode_label(user["mode"])} · 免验证剩余时间：约 {user.get("remember_minutes", 0)} 分钟</div>', unsafe_allow_html=True)
-    with c3:
-        if st.button("退出登录", use_container_width=True):
-            logout_user()
-
-
-def sidebar_common(user: dict):
-    with st.sidebar:
-        st.markdown('<div class="section-title">系统设置</div>', unsafe_allow_html=True)
-        if st.button("清缓存并刷新价格", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
-        st.markdown("---")
-        st.markdown(f'<div class="hint">数据库路径：{DB_PATH}</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="hint">当前模式：{mode_label(user["mode"])} | 当前用户：{user["display_name"]}</div>', unsafe_allow_html=True)
 
 
 def main():
@@ -1208,11 +1500,10 @@ def main():
 
     if user["role"] == "admin":
         admin_panel(user)
+    elif user["mode"] == "margin":
+        margin_system(user)
     else:
-        if user["mode"] == "margin":
-            margin_system(user)
-        else:
-            normal_system(user)
+        normal_system(user)
 
 
 if __name__ == "__main__":
