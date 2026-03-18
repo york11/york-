@@ -673,18 +673,43 @@ def _quote_from_eastmoney(code: str) -> Tuple[str, float, float]:
     code = normalize_code(code)
     secid = f"1.{code}" if code.startswith(("60", "68", "90", "51", "58")) else f"0.{code}"
     url = "https://push2.eastmoney.com/api/qt/stock/get"
-    params = {"secid": secid, "fields": "f57,f58,f43,f46", "invt": "2", "fltt": "2"}
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
+    params = {
+        "secid": secid,
+        "fields": "f57,f58,f43,f46",
+        "invt": "2",
+        "fltt": "2",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://quote.eastmoney.com/",
+    }
+
     r = requests.get(url, params=params, headers=headers, timeout=8)
     r.raise_for_status()
     data = r.json().get("data") or {}
+
     stock_name = str(data.get("f58") or code)
-    current_price = safe_float(data.get("f43"), 0.0) / 100
-    open_price = safe_float(data.get("f46"), 0.0) / 100
+
+    raw_current = safe_float(data.get("f43"), 0.0)
+    raw_open = safe_float(data.get("f46"), 0.0)
+
+    # 自动判断是否需要缩放
+    # 如果返回像 3334 这种，说明要 /100
+    # 如果返回像 33.34 这种，就不要再 /100
+    if raw_current > 1000:
+        current_price = raw_current / 100
+    else:
+        current_price = raw_current
+
+    if raw_open > 1000:
+        open_price = raw_open / 100
+    else:
+        open_price = raw_open
+
     if current_price <= 0:
         raise RuntimeError("东方财富接口当前价格无效")
-    return stock_name, current_price, open_price
 
+    return stock_name, current_price, open_price
 
 def _quote_from_tencent(code: str) -> Tuple[str, float, float]:
     code = normalize_code(code)
