@@ -874,8 +874,6 @@ def get_cookie_manager():
 def bootstrap_session_state():
     if "auth" not in st.session_state:
         st.session_state.auth = None
-    if "cookie_retry" not in st.session_state:
-        st.session_state.cookie_retry = 0
 
 
 def try_restore_login_from_cookie():
@@ -885,15 +883,11 @@ def try_restore_login_from_cookie():
         return
 
     cookie_manager = get_cookie_manager()
-    token = cookie_manager.get(AUTH_COOKIE_NAME)
 
-    if token is None:
-        if st.session_state.cookie_retry < 2:
-            st.session_state.cookie_retry += 1
-            st.stop()
-        return
-
-    st.session_state.cookie_retry = 0
+    try:
+        token = cookie_manager.get(AUTH_COOKIE_NAME)
+    except Exception:
+        token = None
 
     if not token:
         return
