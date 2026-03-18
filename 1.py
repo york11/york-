@@ -46,18 +46,24 @@ st.markdown(
     .kpi-label {font-size: 0.95rem; color: #6b7280; margin-bottom: 6px;}
     .kpi-value {font-size: 2rem; font-weight: 800; line-height: 1.15;}
     .kpi-small {font-size: 1.18rem; font-weight: 700; line-height: 1.25;}
-    .profit { color: #16a34a; }
-    .loss { color: #dc2626; }
+
+    /* A股风格：红涨绿跌 */
+    .profit { color: #dc2626; }
+    .loss { color: #16a34a; }
     .neutral { color: #111827; }
+
     .section-title {font-size: 1.15rem; font-weight: 760; margin: 0 0 10px 0;}
     .hint {font-size: 0.88rem; color: #6b7280;}
     .pill-green, .pill-red, .pill-gray, .pill-blue {
         display: inline-block; padding: 6px 10px; border-radius: 999px; font-size: 0.88rem; font-weight: 700;
     }
-    .pill-green {background: rgba(22,163,74,0.12); color: #15803d;}
-    .pill-red {background: rgba(220,38,38,0.12); color: #b91c1c;}
+
+    /* A股风格：盈利红、亏损绿 */
+    .pill-green {background: rgba(220,38,38,0.12); color: #b91c1c;}
+    .pill-red {background: rgba(22,163,74,0.12); color: #15803d;}
     .pill-gray {background: rgba(100,116,139,0.12); color: #475569;}
     .pill-blue {background: rgba(37,99,235,0.12); color: #1d4ed8;}
+
     div[data-testid="stMetric"] {
         background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(248,250,252,0.98));
         border: 1px solid rgba(0,0,0,0.08);
@@ -683,7 +689,6 @@ def _quote_from_eastmoney(code: str) -> Tuple[str, float, float]:
         "User-Agent": "Mozilla/5.0",
         "Referer": "https://quote.eastmoney.com/",
     }
-
     r = requests.get(url, params=params, headers=headers, timeout=8)
     r.raise_for_status()
     data = r.json().get("data") or {}
@@ -693,23 +698,14 @@ def _quote_from_eastmoney(code: str) -> Tuple[str, float, float]:
     raw_current = safe_float(data.get("f43"), 0.0)
     raw_open = safe_float(data.get("f46"), 0.0)
 
-    # 自动判断是否需要缩放
-    # 如果返回像 3334 这种，说明要 /100
-    # 如果返回像 33.34 这种，就不要再 /100
-    if raw_current > 1000:
-        current_price = raw_current / 100
-    else:
-        current_price = raw_current
-
-    if raw_open > 1000:
-        open_price = raw_open / 100
-    else:
-        open_price = raw_open
+    current_price = raw_current / 100 if raw_current > 1000 else raw_current
+    open_price = raw_open / 100 if raw_open > 1000 else raw_open
 
     if current_price <= 0:
         raise RuntimeError("东方财富接口当前价格无效")
 
     return stock_name, current_price, open_price
+
 
 def _quote_from_tencent(code: str) -> Tuple[str, float, float]:
     code = normalize_code(code)
@@ -878,22 +874,34 @@ def get_cookie_manager():
 def bootstrap_session_state():
     if "auth" not in st.session_state:
         st.session_state.auth = None
+    if "cookie_retry" not in st.session_state:
+        st.session_state.cookie_retry = 0
 
 
 def try_restore_login_from_cookie():
     bootstrap_session_state()
+
     if st.session_state.auth:
         return
 
     cookie_manager = get_cookie_manager()
     token = cookie_manager.get(AUTH_COOKIE_NAME)
+
+    if token is None:
+        if st.session_state.cookie_retry < 2:
+            st.session_state.cookie_retry += 1
+            st.stop()
+        return
+
+    st.session_state.cookie_retry = 0
+
     if not token:
         return
 
     session_row = get_valid_session(token)
     if not session_row:
         try:
-            cookie_manager.delete(AUTH_COOKIE_NAME)
+            cookie_manager.delete(AUTH_COOKIE_NAME, key=f"delete_invalid_{uuid.uuid4()}")
         except Exception:
             pass
         return
@@ -921,11 +929,14 @@ def is_auth_valid() -> bool:
 def login_user(user_row: sqlite3.Row, remember_minutes: int):
     token, expires_at = create_session(user_row["id"], remember_minutes)
     cookie_manager = get_cookie_manager()
+    expire_dt = datetime.now() + timedelta(minutes=remember_minutes)
+
     try:
         cookie_manager.set(
             AUTH_COOKIE_NAME,
             token,
-            expires_at=datetime.now() + timedelta(minutes=remember_minutes),
+            expires_at=expire_dt,
+            key=f"set_cookie_{token}",
         )
     except Exception:
         pass
@@ -946,7 +957,7 @@ def logout_user():
     if token:
         invalidate_session(token)
     try:
-        cookie_manager.delete(AUTH_COOKIE_NAME)
+        cookie_manager.delete(AUTH_COOKIE_NAME, key=f"delete_cookie_{uuid.uuid4()}")
     except Exception:
         pass
     st.session_state.auth = None
@@ -973,11 +984,14 @@ def check_login() -> bool:
     c1, c2, c3 = st.columns([1.1, 1.2, 1.1])
     with c2:
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        selected_user = st.selectbox("选择用户", user_choices, index=0 if user_choices else None)
-        password = st.text_input("密码", type="password", placeholder="请输入密码")
-        remember_choice = st.radio("免重复验证", list(SESSION_MINUTES_MAP.keys()), horizontal=True, index=1)
 
-        if st.button("登录", use_container_width=True, type="primary"):
+        with st.form("login_form", clear_on_submit=False):
+            selected_user = st.selectbox("选择用户", user_choices, index=0 if user_choices else None)
+            password = st.text_input("密码", type="password", placeholder="请输入密码")
+            remember_choice = st.radio("免重复验证", list(SESSION_MINUTES_MAP.keys()), horizontal=True, index=1)
+            submitted = st.form_submit_button("登录", use_container_width=True, type="primary")
+
+        if submitted:
             user_row = get_user_by_login(selected_user)
             if not user_row:
                 st.error("该用户不存在或已停用。")
@@ -989,6 +1003,7 @@ def check_login() -> bool:
                 st.rerun()
             else:
                 st.error("密码错误")
+
         st.markdown("</div>", unsafe_allow_html=True)
     return False
 
@@ -1081,12 +1096,17 @@ def render_margin_position_card(row: sqlite3.Row):
     else:
         liq_80_text = f"还需下跌 {pct(liq_80['additional_drop_pct'])} / {money(liq_80['additional_drop_price'])}"
 
+    used_vs_financed_principal_pct = (
+        metrics.used_position_amount / metrics.financed_principal * 100
+        if metrics.financed_principal > 0 else 0.0
+    )
+
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown(f'**{stock_name}（{row["stock_code"]}）**')
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("现价", f"{metrics.current_price:.4f}" if metrics.current_price > 0 else "--")
     c2.metric("浮盈亏", money(metrics.profit_loss), delta=pct(metrics.profit_loss_pct))
-    c3.metric("配资本金", money(metrics.financed_principal))
+    c3.metric("占用总本金", pct(used_vs_financed_principal_pct))
     c4.metric("累计利息", money(metrics.accumulated_fee))
     c5, c6 = st.columns(2)
     with c5:
