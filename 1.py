@@ -78,10 +78,10 @@ DB_PATH = DATA_DIR / "stock_margin_tracker.db"
 # -------------------------
 DEFAULT_USERS = [
     {"login_name": "admin", "display_name": "管理员", "password": "060913yu", "role": "admin", "mode": "admin"},
-    {"login_name": "俞", "display_name": "俞", "password": "060913", "role": "user", "mode": "margin"},
+    {"login_name": "俞（融）", "display_name": "俞（融）", "password": "060913yu", "role": "user", "mode": "margin"},
     {"login_name": "俞（普通账户）", "display_name": "俞（普通账户）", "password": "060913yu", "role": "user", "mode": "normal"},
     {"login_name": "俞（小账户）", "display_name": "俞（小账户）", "password": "060913yu", "role": "user", "mode": "normal"},
-    {"login_name": "管", "display_name": "管", "password": "123456", "role": "user", "mode": "normal"},
+    {"login_name": "管俊浩", "display_name": "管俊浩", "password": "123456", "role": "user", "mode": "normal"},
 ]
 
 SESSION_MINUTES_MAP = {
