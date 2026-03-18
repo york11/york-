@@ -694,7 +694,6 @@ def _quote_from_eastmoney(code: str) -> Tuple[str, float, float]:
     data = r.json().get("data") or {}
 
     stock_name = str(data.get("f58") or code)
-
     raw_current = safe_float(data.get("f43"), 0.0)
     raw_open = safe_float(data.get("f46"), 0.0)
 
@@ -845,17 +844,21 @@ def calculate_risk_line_info(total_cost: float, current_price: float, shares: in
     financed_principal = max(safe_float(financed_principal), 0.0)
     total_cost = max(safe_float(total_cost), 0.0)
     current_price = max(safe_float(current_price), 0.0)
+
     threshold_loss_amount = financed_principal * line_pct
     current_loss_amount = abs(current_profit_loss) if current_profit_loss < 0 else 0.0
     remaining_loss_amount = max(0.0, threshold_loss_amount - current_loss_amount)
+
     if shares > 0:
         target_price = max(0.0, (total_cost - threshold_loss_amount) / shares)
         additional_drop_price = max(0.0, current_price - target_price)
     else:
         target_price = 0.0
         additional_drop_price = 0.0
+
     additional_drop_pct = max(0.0, additional_drop_price / current_price * 100) if current_price > 0 else 0.0
     triggered = current_loss_amount >= threshold_loss_amount and threshold_loss_amount > 0
+
     return {
         "target_price": target_price,
         "additional_drop_price": additional_drop_price,
@@ -1046,11 +1049,13 @@ def render_normal_position_card(row: sqlite3.Row):
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown(f'**{stock_name}（{row["stock_code"]}）**')
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("现价", f"{current_price:.4f}" if quote_ok else "--")
-    c2.metric("总盈亏", money(total_profit), delta=pct(total_profit_pct))
-    c3.metric("当日浮盈亏", money(daily_profit), delta=pct(daily_profit_pct))
+    c2.metric("总盈亏", money(total_profit), delta=pct(total_profit_pct), delta_color="inverse")
+    c3.metric("当日浮盈亏", money(daily_profit), delta=pct(daily_profit_pct), delta_color="inverse")
     c4.metric("总成本", money(total_cost))
+
     st.caption(f'买入价：{buy_price:.4f} ｜ 股数：{shares:,} ｜ 买入时间：{row["buy_time"] or "--"}')
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1077,8 +1082,22 @@ def render_margin_position_card(row: sqlite3.Row):
         held_days=row["held_days"],
     )
 
-    warning_70 = calculate_risk_line_info(metrics.total_cost, metrics.current_price, metrics.shares, metrics.financed_principal, 0.70, metrics.profit_loss)
-    liq_80 = calculate_risk_line_info(metrics.total_cost, metrics.current_price, metrics.shares, metrics.financed_principal, 0.80, metrics.profit_loss)
+    warning_70 = calculate_risk_line_info(
+        metrics.total_cost,
+        metrics.current_price,
+        metrics.shares,
+        metrics.financed_principal,
+        0.70,
+        metrics.profit_loss,
+    )
+    liq_80 = calculate_risk_line_info(
+        metrics.total_cost,
+        metrics.current_price,
+        metrics.shares,
+        metrics.financed_principal,
+        0.80,
+        metrics.profit_loss,
+    )
 
     if warning_70["triggered"]:
         warning_70_text = "已触发"
@@ -1090,24 +1109,31 @@ def render_margin_position_card(row: sqlite3.Row):
     else:
         liq_80_text = f"还需下跌 {pct(liq_80['additional_drop_pct'])} / {money(liq_80['additional_drop_price'])}"
 
-    used_vs_financed_principal_pct = (
-        metrics.used_position_amount / metrics.financed_principal * 100
+    # 亏钱为正，赚钱为负
+    margin_usage_pct = (
+        (-metrics.profit_loss / metrics.financed_principal) * 100
         if metrics.financed_principal > 0 else 0.0
     )
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown(f'**{stock_name}（{row["stock_code"]}）**')
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("现价", f"{metrics.current_price:.4f}" if metrics.current_price > 0 else "--")
-    c2.metric("浮盈亏", money(metrics.profit_loss), delta=pct(metrics.profit_loss_pct))
-    c3.metric("占用总本金", pct(used_vs_financed_principal_pct))
+    c2.metric("浮盈亏", money(metrics.profit_loss), delta=pct(metrics.profit_loss_pct), delta_color="inverse")
+    with c3:
+        render_small_card("保证金占用率", pct(margin_usage_pct), pnl_class(-margin_usage_pct))
     c4.metric("累计利息", money(metrics.accumulated_fee))
+
     c5, c6 = st.columns(2)
     with c5:
         st.caption(f"70%线：{warning_70_text}")
     with c6:
         st.caption(f"80%线：{liq_80_text}")
-    st.caption(f'买入价：{metrics.buy_price:.4f} ｜ 股数：{metrics.shares:,} ｜ 杠杆：{metrics.leverage:.2f} ｜ 买入时间：{row["buy_time"] or "--"}')
+
+    st.caption(
+        f'买入价：{metrics.buy_price:.4f} ｜ 股数：{metrics.shares:,} ｜ 杠杆：{metrics.leverage:.2f} ｜ 买入时间：{row["buy_time"] or "--"}'
+    )
     st.markdown("</div>", unsafe_allow_html=True)
 
 
