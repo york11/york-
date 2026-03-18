@@ -78,10 +78,10 @@ DB_PATH = DATA_DIR / "stock_margin_tracker.db"
 # -------------------------
 DEFAULT_USERS = [
     {"login_name": "admin", "display_name": "管理员", "password": "060913yu", "role": "admin", "mode": "admin"},
-    {"login_name": "俞（融）", "display_name": "俞（融）", "password": "060913yu", "role": "user", "mode": "margin"},
+    {"login_name": "俞", "display_name": "俞", "password": "060913", "role": "user", "mode": "margin"},
     {"login_name": "俞（普通账户）", "display_name": "俞（普通账户）", "password": "060913yu", "role": "user", "mode": "normal"},
     {"login_name": "俞（小账户）", "display_name": "俞（小账户）", "password": "060913yu", "role": "user", "mode": "normal"},
-    {"login_name": "管俊浩", "display_name": "管俊浩", "password": "123456", "role": "user", "mode": "normal"},
+    {"login_name": "管", "display_name": "管", "password": "123456", "role": "user", "mode": "normal"},
 ]
 
 SESSION_MINUTES_MAP = {
@@ -460,7 +460,7 @@ def get_audit_logs(limit: int = 100) -> List[sqlite3.Row]:
 # -------------------------
 # 行情
 # -------------------------
-def get_quote_from_sina(code: str) -> Tuple[str, float, float]:
+def _quote_from_sina(code: str) -> Tuple[str, float, float]:
     code = normalize_code(code)
     symbol = f"{get_market_prefix(code)}{code}"
     url = f"https://hq.sinajs.cn/list={symbol}"
@@ -473,24 +473,84 @@ def get_quote_from_sina(code: str) -> Tuple[str, float, float]:
     r.encoding = "gbk"
     text = r.text.strip()
     if "=" not in text:
-        raise RuntimeError("行情接口返回格式异常")
+        raise RuntimeError("新浪接口返回格式异常")
     raw = text.split("=", 1)[1].strip().rstrip(";").strip().strip('"')
     if not raw:
-        raise RuntimeError("未取到有效行情数据，请检查代码")
+        raise RuntimeError("新浪接口未返回有效行情数据")
     fields = raw.split(",")
     if len(fields) < 4:
-        raise RuntimeError("行情字段不足")
+        raise RuntimeError("新浪接口字段不足")
     stock_name = fields[0].strip() or code
     open_price = safe_float(fields[1], 0.0)
     current_price = safe_float(fields[3], 0.0)
     if current_price <= 0:
-        raise RuntimeError("当前价格无效，可能休市、停牌或代码错误")
+        raise RuntimeError("新浪接口当前价格无效")
     return stock_name, current_price, open_price
+
+
+def _quote_from_tencent(code: str) -> Tuple[str, float, float]:
+    code = normalize_code(code)
+    symbol = f"{get_market_prefix(code)}{code}"
+    url = f"https://qt.gtimg.cn/q={symbol}"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://gu.qq.com/",
+    }
+    r = requests.get(url, headers=headers, timeout=8)
+    r.raise_for_status()
+    r.encoding = "gbk"
+    text = r.text.strip()
+    if "~" not in text:
+        raise RuntimeError("腾讯接口返回格式异常")
+    parts = text.split("~")
+    if len(parts) < 6:
+        raise RuntimeError("腾讯接口字段不足")
+    stock_name = parts[1].strip() or code
+    current_price = safe_float(parts[3], 0.0)
+    open_price = safe_float(parts[5], 0.0)
+    if current_price <= 0:
+        raise RuntimeError("腾讯接口当前价格无效")
+    return stock_name, current_price, open_price
+
+
+def _quote_from_eastmoney(code: str) -> Tuple[str, float, float]:
+    code = normalize_code(code)
+    secid = f"1.{code}" if code.startswith(("60", "68", "90", "51", "58")) else f"0.{code}"
+    url = "https://push2.eastmoney.com/api/qt/stock/get"
+    params = {
+        "secid": secid,
+        "fields": "f57,f58,f43,f46",
+        "invt": "2",
+        "fltt": "2",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://quote.eastmoney.com/",
+    }
+    r = requests.get(url, params=params, headers=headers, timeout=8)
+    r.raise_for_status()
+    data = r.json().get("data") or {}
+    stock_name = str(data.get("f58") or code)
+    current_price = safe_float(data.get("f43"), 0.0) / 100
+    open_price = safe_float(data.get("f46"), 0.0) / 100
+    if current_price <= 0:
+        raise RuntimeError("东方财富接口当前价格无效")
+    return stock_name, current_price, open_price
+
+
+def get_realtime_quote(code: str) -> Tuple[str, float, float]:
+    errors = []
+    for fn in (_quote_from_tencent, _quote_from_eastmoney, _quote_from_sina):
+        try:
+            return fn(code)
+        except Exception as e:
+            errors.append(f"{fn.__name__}: {e}")
+    raise RuntimeError("；".join(errors))
 
 
 @st.cache_data(ttl=5)
 def cached_quote(code: str) -> Tuple[str, float, float]:
-    return get_quote_from_sina(code)
+    return get_realtime_quote(code)
 
 
 # -------------------------
